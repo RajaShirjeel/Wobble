@@ -109,6 +109,10 @@ class RepairTests(unittest.TestCase):
         self.assertEqual(report.model_attempts[1].final.completed_runs, 3)
         self.assertEqual(model.evidence[1]["previous_attempts"][0]["status"], "rejected")
         self.assertEqual(model.evidence[0]["allowed_insertions"], {"test_order.py": [7]})
+        self.assertIn(
+            {"file": "test_order.py", "line": 15, "code": "    cache.clear()"},
+            model.evidence[0]["cleanup_examples"],
+        )
         self.assertEqual((REPO / "test_order.py").read_text(encoding="utf-8"), original)
 
 

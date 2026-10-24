@@ -94,6 +94,33 @@ def _allowed_insertions(prefix: list[str], source: dict[str, str]) -> dict[str, 
     return {file: sorted(lines) for file, lines in points.items() if lines}
 
 
+def _cleanup_examples(source: dict[str, str]) -> list[dict]:
+    """Show the model short cleanup statements that existing tests already use."""
+    examples = []
+    methods = {"clear", "pop", "discard", "remove", "unlink", "close"}
+    for file, contents in source.items():
+        for node in ast.walk(ast.parse(contents)):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or not node.name.startswith("test_"):
+                continue
+            for statement in node.body:
+                call = statement.value if isinstance(statement, ast.Expr) else None
+                if not (
+                    isinstance(statement, ast.Delete)
+                    or isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                    and call.func.attr in methods
+                ):
+                    continue
+                code = ast.get_source_segment(contents, statement)
+                if code and "\n" not in code and len(code) <= 200:
+                    examples.append({
+                        "file": file, "line": statement.lineno,
+                        "code": " " * statement.col_offset + code,
+                    })
+                    if len(examples) == 8:
+                        return examples
+    return examples
+
+
 def patch_from_proposal(repo: Path, proposal: PatchProposal, allowed: dict[str, str]) -> str:
     if proposal.file not in allowed:
         raise ValueError("Proposal targets a file outside the minimized reproducer")
@@ -317,6 +344,7 @@ def repair(
             ),
             "allowed_files": list(insertion_points),
             "allowed_insertions": insertion_points,
+            "cleanup_examples": _cleanup_examples(allowed),
             "numbered_source": {
                 file: "\n".join(f"{number}: {line}" for number, line in enumerate(source.splitlines(), 1))
                 for file, source in allowed.items()

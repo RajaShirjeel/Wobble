@@ -1,0 +1,12 @@
+FROM python:3.11-slim-bookworm
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libfaketime \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s "$(find /usr/lib -name libfaketime.so.1 -print -quit)" /usr/local/lib/libfaketime.so.1
+
+RUN python -m pip install --no-cache-dir "pytest>=8,<10"
+
+ENV PYTHONDONTWRITEBYTECODE=1
+WORKDIR /workspace
+USER 10001:10001

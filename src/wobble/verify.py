@@ -7,6 +7,7 @@ import random
 import shutil
 import subprocess
 import tempfile
+from copy import copy as shallow_copy
 from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -58,12 +59,12 @@ def _assertions(path: Path) -> Counter[str]:
     return result
 
 
-def _victim_function(path: Path, nodeid: str) -> str | None:
+def _test_function(tree: ast.Module, nodeid: str) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
     parts = nodeid.split("::")[1:]
     if not parts:
         return None
     parts[-1] = parts[-1].split("[", 1)[0]
-    scope = ast.parse(path.read_text(encoding="utf-8")).body
+    scope = tree.body
     selected = None
     for name in parts:
         matches = [
@@ -77,7 +78,29 @@ def _victim_function(path: Path, nodeid: str) -> str | None:
         scope = selected.body
     if not isinstance(selected, (ast.FunctionDef, ast.AsyncFunctionDef)):
         return None
-    return ast.dump(selected, include_attributes=False)
+    return selected
+
+
+def _victim_function(path: Path, nodeid: str) -> str | None:
+    selected = _test_function(ast.parse(path.read_text(encoding="utf-8")), nodeid)
+    return ast.dump(selected, include_attributes=False) if selected is not None else None
+
+
+def _preserves_test_body(
+    original: ast.FunctionDef | ast.AsyncFunctionDef,
+    changed: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> bool:
+    """Allow appended cleanup, but preserve each original test statement and its header."""
+    old_header, new_header = shallow_copy(original), shallow_copy(changed)
+    old_header.body, new_header.body = [], []
+    if ast.dump(old_header, include_attributes=False) != ast.dump(new_header, include_attributes=False):
+        return False
+    if len(changed.body) < len(original.body):
+        return False
+    return all(
+        ast.dump(before, include_attributes=False) == ast.dump(after, include_attributes=False)
+        for before, after in zip(original.body, changed.body)
+    )
 
 
 def _apply_patch(copy: Path, patch: Path) -> None:
@@ -129,6 +152,17 @@ def verify_patch(
             if old_file.suffix == ".py" and old_file.is_file() and new_file.is_file():
                 if _assertions(old_file) - _assertions(new_file):
                     return result("rejected", f"Patch changed or removed assertions from {file}")
+                original_tree = ast.parse(old_file.read_text(encoding="utf-8"))
+                changed_tree = ast.parse(new_file.read_text(encoding="utf-8"))
+                for nodeid in before:
+                    if nodeid == victim or nodeid.split("::", 1)[0] != file:
+                        continue
+                    original_test = _test_function(original_tree, nodeid)
+                    changed_test = _test_function(changed_tree, nodeid)
+                    if original_test is not None and (
+                        changed_test is None or not _preserves_test_body(original_test, changed_test)
+                    ):
+                        return result("rejected", f"Patch changed original test behavior in {nodeid}")
 
         baseline = original_runner.run([*prefix, victim])
         if baseline.outcomes[victim]["status"] != "failed":

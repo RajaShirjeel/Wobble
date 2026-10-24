@@ -3,7 +3,7 @@ from pathlib import Path
 
 from wobble.agent import run_agent
 from wobble.hunt import hunt
-from wobble.ollama_client import Decision, ModelError, parse_decision
+from wobble.ollama_client import Decision, ModelError, OllamaClient, parse_decision
 from wobble.runner import RunResult
 
 
@@ -50,6 +50,11 @@ class AgentTests(unittest.TestCase):
             parse_decision({
                 "action": "shell", "test_id": "", "diagnosis": "unknown",
             })
+
+    def test_cloud_and_empty_model_tags_are_rejected_before_inference(self):
+        for name in ("minimax-m3:cloud", ""):
+            with self.subTest(name=name), self.assertRaisesRegex(ModelError, "local model"):
+                OllamaClient(name)
 
     def test_model_cannot_select_unobserved_test(self):
         runner = FakeRunner()
