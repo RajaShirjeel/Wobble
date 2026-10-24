@@ -8,6 +8,7 @@ from pathlib import Path
 from wobble.container_runner import ContainerPytestRunner
 from wobble.hunt import hunt
 from wobble.investigate import investigate
+from wobble.model_setup import SetupError, installed_model, list_models, resolve_ollama_url
 from wobble.ollama_client import OllamaClient
 from wobble.repair import repair
 
@@ -30,6 +31,17 @@ def main() -> int:
     args = parser.parse_args()
     if args.hunt_runs < 2 or args.screen_runs < 1 or args.verify_runs < args.screen_runs:
         parser.error("Run budgets must be positive; verify-runs must be at least screen-runs")
+    if len(set(args.model)) != len(args.model):
+        parser.error("Each --model name may appear only once")
+    if any(not name.strip() or name.endswith(":cloud") for name in args.model):
+        parser.error("--model requires an installed local model, not a cloud tag")
+    try:
+        models = list_models(resolve_ollama_url())
+    except SetupError as error:
+        parser.error(str(error))
+    missing = [name for name in args.model if installed_model(models, name) is None]
+    if missing:
+        parser.error(f"Models are not installed on the configured Ollama server: {', '.join(missing)}")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     detailed = {}
     counts = {model: 0 for model in args.model}

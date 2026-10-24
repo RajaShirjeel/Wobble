@@ -67,6 +67,24 @@ class VerifierTests(unittest.TestCase):
         self.assertEqual(result.status, "rejected")
         self.assertIn("changed or removed assertions", result.reason)
 
+    def test_patch_that_disables_polluter_without_removing_assertions_is_rejected(self):
+        original = (REPO / "test_order.py").read_text(encoding="utf-8")
+        for replacement in ("    pass", '    return\n    cache["user"] = "bob"'):
+            with self.subTest(replacement=replacement), tempfile.TemporaryDirectory() as directory:
+                changed = original.replace('    cache["user"] = "bob"', replacement)
+                diff = "".join(difflib.unified_diff(
+                    original.splitlines(keepends=True), changed.splitlines(keepends=True),
+                    fromfile="a/test_order.py", tofile="b/test_order.py",
+                ))
+                patch = Path(directory) / "weaken-polluter.diff"
+                patch.write_text(diff, encoding="utf-8")
+                result = verify_patch(
+                    REPO, patch, "test_order.py::test_b_victim",
+                    ["test_order.py::test_a_polluter"], PytestRunner, runs=2,
+                )
+                self.assertEqual(result.status, "rejected")
+                self.assertIn("changed original test behavior", result.reason)
+
     def test_patch_that_returns_before_victim_assertion_is_rejected(self):
         original = (REPO / "test_order.py").read_text(encoding="utf-8")
         changed = original.replace(

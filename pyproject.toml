@@ -3,18 +3,25 @@ requires = ["setuptools>=70"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "wobble"
+name = "wobble-flaky"
 version = "0.1.0"
 description = "A local-first hunter for order-dependent pytest failures"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["pytest>=8,<10"]
 
+[project.urls]
+Repository = "https://github.com/LiteralKrishu/Wobble"
+Issues = "https://github.com/LiteralKrishu/Wobble/issues"
+
 [project.scripts]
 wobble = "wobble.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+wobble = ["resources/Dockerfile.runner"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

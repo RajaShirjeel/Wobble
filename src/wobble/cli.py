@@ -4,12 +4,14 @@ import argparse
 import json
 import sys
 from dataclasses import asdict
+from importlib import resources
 from pathlib import Path
 
 from wobble.agent import run_agent
 from wobble.container_runner import ContainerPytestRunner
 from wobble.hunt import hunt
 from wobble.investigate import investigate
+from wobble.model_setup import DEFAULT_MODEL, SetupError, doctor, setup
 from wobble.ollama_client import ModelError, OllamaClient
 from wobble.repair import repair
 from wobble.runner import PytestRunner, RunnerError
@@ -19,6 +21,19 @@ from wobble.verify import reproducer_from_evidence, verify_patch
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="wobble", description="Hunt flaky pytest tests")
     commands = parser.add_subparsers(dest="command", required=True)
+    doctor_command = commands.add_parser("doctor", help="Check the local Ollama model without downloading")
+    doctor_command.add_argument("--model", default=DEFAULT_MODEL)
+    doctor_command.add_argument("--ollama-url", help="Ollama server URL (default: local server)")
+    doctor_command.add_argument("--timeout", type=float, default=180)
+    doctor_command.add_argument("--check-inference", action="store_true", help="Ask the model for a short structured reply")
+    setup_command = commands.add_parser("setup", help="Install and check a local model with consent")
+    setup_command.add_argument("--model", default=DEFAULT_MODEL)
+    setup_command.add_argument("--ollama-url", help="Ollama server URL (default: local server)")
+    setup_command.add_argument("--timeout", type=float, default=180)
+    setup_command.add_argument("--yes", action="store_true", help="Approve a model download without a prompt")
+    dockerfile_command = commands.add_parser("dockerfile", help="Export the packaged Docker runner recipe")
+    dockerfile_command.add_argument("--output", type=Path, required=True)
+    dockerfile_command.add_argument("--force", action="store_true", help="Replace an existing output file")
     hunt_command = commands.add_parser("hunt", help="Repeat tests in shuffled orders")
     hunt_command.add_argument("repo", type=Path, help="Trusted repository to test")
     hunt_command.add_argument("--select", default=".", help="pytest path or node ID")
@@ -34,7 +49,8 @@ def build_parser() -> argparse.ArgumentParser:
     hunt_command.add_argument("--minimize", action="store_true")
     hunt_command.add_argument("--agent", action="store_true", help="Let a local model choose investigation experiments")
     hunt_command.add_argument("--agent-steps", type=int, default=5)
-    hunt_command.add_argument("--model", default="qwen3:4b-instruct")
+    hunt_command.add_argument("--model", default=DEFAULT_MODEL)
+    hunt_command.add_argument("--ollama-url", help="Ollama server URL for --agent")
     hunt_command.add_argument("--model-timeout", type=float, default=90)
     hunt_command.add_argument("--replay-budget", type=int, default=80)
     hunt_command.add_argument("--output", type=Path, help="Save full JSON evidence")
@@ -49,7 +65,8 @@ def build_parser() -> argparse.ArgumentParser:
     repair_command = commands.add_parser("repair", help="Ask a local model for a patch and verify it")
     repair_command.add_argument("repo", type=Path)
     repair_command.add_argument("--evidence", type=Path, required=True)
-    repair_command.add_argument("--model", default="qwen3:4b-instruct")
+    repair_command.add_argument("--model", default=DEFAULT_MODEL)
+    repair_command.add_argument("--ollama-url", help="Ollama server URL")
     repair_command.add_argument("--model-timeout", type=float, default=180)
     repair_command.add_argument("--attempts", type=int, default=2)
     repair_command.add_argument("--screen-runs", type=int, default=5)
@@ -76,6 +93,16 @@ def _verify_command(args: argparse.Namespace) -> int:
     return 0 if result.status == "verified" else 1
 
 
+def _dockerfile_command(args: argparse.Namespace) -> int:
+    if args.output.exists() and not args.force:
+        raise ValueError(f"Output already exists: {args.output}; use --force to replace it")
+    recipe = resources.files("wobble").joinpath("resources/Dockerfile.runner").read_text(encoding="utf-8")
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(recipe, encoding="utf-8")
+    print(f"Saved Docker runner recipe to {args.output}")
+    return 0
+
+
 def _runner_factory(conditions: dict, timeout: float, image: str):
     def make_runner(repo: Path):
         if conditions.get("cpu_limit") is None:
@@ -92,7 +119,7 @@ def _repair_command(args: argparse.Namespace) -> int:
     _, _, _, conditions = reproducer_from_evidence(args.evidence)
     if args.baseline_only and args.no_baseline:
         raise ValueError("--baseline-only requires the baseline")
-    client = None if args.baseline_only else OllamaClient(args.model, args.model_timeout)
+    client = None if args.baseline_only else OllamaClient(args.model, args.model_timeout, args.ollama_url)
     report = repair(
         args.repo, args.evidence, _runner_factory(conditions, args.timeout, args.image),
         client, args.attempts, args.screen_runs, args.verify_runs,
@@ -123,12 +150,19 @@ def _repair_command(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.command == "doctor":
+            return doctor(args.model, args.ollama_url, args.timeout, args.check_inference)
+        if args.command == "setup":
+            return setup(args.model, args.ollama_url, args.timeout, args.yes)
+        if args.command == "dockerfile":
+            return _dockerfile_command(args)
         if args.command == "verify":
             return _verify_command(args)
         if args.command == "repair":
             return _repair_command(args)
         if args.agent and args.minimize:
             raise ValueError("Use either --agent or --minimize for one investigation")
+        client = OllamaClient(args.model, args.model_timeout, args.ollama_url) if args.agent else None
         if args.runner == "docker":
             runner = ContainerPytestRunner(
                 args.repo, args.timeout, args.image, args.cpus, args.memory_mb,
@@ -164,7 +198,6 @@ def main(argv: list[str] | None = None) -> int:
                 print("No test showed both a pass and a failure; nothing to minimize")
         if args.agent:
             if flaky:
-                client = OllamaClient(args.model, args.model_timeout)
                 try:
                     result = run_agent(
                         runner, report, flaky.nodeid, client, args.agent_steps,
@@ -187,7 +220,7 @@ def main(argv: list[str] | None = None) -> int:
             args.output.write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
             print(f"Saved evidence to {args.output}")
         return 2 if "agent_error" in evidence else 0
-    except (RunnerError, ValueError, ModelError) as error:
+    except (OSError, RunnerError, ValueError, ModelError, SetupError) as error:
         print(f"wobble: {error}", file=sys.stderr)
         return 2
 

@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from wobble.model_setup import DEFAULT_MODEL, resolve_ollama_url
+
 
 class ModelError(RuntimeError):
     """The local model was unavailable or returned an invalid action."""
@@ -84,9 +86,15 @@ def parse_decision(value: object) -> Decision:
 
 
 class OllamaClient:
-    def __init__(self, model: str = "qwen3:4b-instruct", timeout_seconds: float = 90):
+    def __init__(
+        self, model: str = DEFAULT_MODEL, timeout_seconds: float = 90,
+        base_url: str | None = None,
+    ):
+        if not model.strip() or model.endswith(":cloud"):
+            raise ModelError("Choose an installed local model; cloud model tags are not supported")
         self.model = model
         self.timeout_seconds = timeout_seconds
+        self.base_url = resolve_ollama_url(base_url)
         self.calls: list[dict[str, str]] = []
 
     @staticmethod
@@ -131,7 +139,7 @@ class OllamaClient:
                 "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 80},
             }
             request = Request(
-                "http://127.0.0.1:11434/api/chat",
+                self.base_url + "/api/chat",
                 data=json.dumps(payload).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
             )
@@ -144,7 +152,9 @@ class OllamaClient:
                 self.calls.append({"raw": raw[:4000], "result": "accepted"})
                 return decision
             except (HTTPError, URLError, TimeoutError) as error:
-                raise ModelError(f"Ollama request failed: {error}") from error
+                raise ModelError(
+                    f"Ollama request failed: {error}. Check 'wobble doctor' and run 'wobble setup' if the model is missing"
+                ) from error
             except (KeyError, TypeError, ValueError, ModelError) as error:
                 self.calls.append({"raw": raw[:4000], "result": str(error)})
                 messages.append({"role": "user", "content": f"Your previous response was invalid: {error}. Return a valid decision."})
@@ -162,8 +172,11 @@ class OllamaClient:
                 "Return one cleanup action inside an earlier polluter test. Select file and after_line "
                 "from allowed_insertions. code is valid Python with exact indentation. "
                 "Insert cleanup after the polluter's last use of shared state. "
-                "A short if block may guard cleanup. Do not copy whole tests, call another test, or add assertions. "
-                "If another test already cleans state, copy only its cleanup statement. "
+                "The code field must have exactly one executable cleanup statement. "
+                "It must remove or restore state left by the polluter. Never repeat its write, add an assertion, "
+                "or guard the write without removing the state. Do not copy whole tests or call another test. "
+                "Check cleanup_examples. If one reverses the polluter's effect, copy only that statement. "
+                "Prefer a direct cleanup call; use a condition only when the cleanup needs it. "
                 "Read previous_attempts and match the exact victim assertion; absent differs from false. "
                 "Keep all tests and assertions. Never change the victim's expected behavior. "
                 "Return JSON only."
@@ -180,7 +193,7 @@ class OllamaClient:
                 "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 500},
             }
             request = Request(
-                "http://127.0.0.1:11434/api/chat",
+                self.base_url + "/api/chat",
                 data=json.dumps(payload).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
             )
@@ -193,7 +206,9 @@ class OllamaClient:
                 self.calls.append({"raw": raw[:4000], "result": "accepted"})
                 return proposal
             except (HTTPError, URLError, TimeoutError) as error:
-                raise ModelError(f"Ollama request failed: {error}") from error
+                raise ModelError(
+                    f"Ollama request failed: {error}. Check 'wobble doctor' and run 'wobble setup' if the model is missing"
+                ) from error
             except (KeyError, TypeError, ValueError, ModelError) as error:
                 self.calls.append({"raw": raw[:4000], "result": str(error)})
                 messages.append({"role": "user", "content": f"Invalid insertion: {error}. Return valid JSON."})
