@@ -2,11 +2,34 @@
 
 Wobble is a local tool that hunts order-dependent pytest failures. It runs a test suite in shuffled orders, reports an observed failure rate with a 95% Wilson interval, and reduces a failing order to a small set of earlier tests.
 
-The first version is a CLI. It can run a trusted repository in fresh Python processes or run each experiment in a disposable Docker container. The container runner can limit CPU, memory, and processes, and shift the wall clock. A local model can choose a bounded sequence of experiments and propose a small source insertion. Wobble verifies each candidate patch in a disposable copy. See [the architecture](https://github.com/LiteralKrishu/Wobble/blob/main/docs/architecture.md) for the build order.
+The first version is a CLI.
+
+## Features
+
+- **Hunt:** run a suite in shuffled, repeatable orders and report per-test pass and fail counts.
+- **Minimize:** reduce a failing order to a 1-minimal set of earlier tests (the "polluters").
+- **Isolate:** run each experiment in a fresh local Python process, or in a disposable Docker container with CPU, memory, and process limits and an optional wall-clock shift.
+- **Investigate:** let a local model (via Ollama) choose a bounded sequence of follow-up experiments.
+- **Repair:** let a local model propose a small source insertion. Wobble verifies every candidate patch in a disposable copy and never touches your repository.
+
+See [the architecture](docs/architecture.md) for the build order.
+
+## Contents
+
+- [Install](#install)
+- [Install Wobble as a Python package](#install-wobble-as-a-python-package)
+- [Run the included demo](#run-the-included-demo)
+- [Run in Docker](#run-in-docker)
+- [Verify a patch](#verify-a-patch)
+- [Repair limits and baseline](#repair-limits-and-baseline)
+- [Reading the statistics](#reading-the-statistics)
+- [Command reference](#command-reference)
+- [Exit codes](#exit-codes)
+- [Run checks](#run-checks)
 
 ## Install
 
-Use Python 3.11 or newer. Run these commands from the Wobble project directory. If `.venv` already exists and Wobble is installed, skip the first two commands.
+Requires Python 3.11 or newer. Run these commands from the Wobble project directory. If `.venv` already exists and Wobble is installed, skip the first two commands.
 
 ```sh
 python3 -m venv .venv
@@ -14,7 +37,9 @@ python3 -m venv .venv
 .venv/bin/wobble --help
 ```
 
-The install needs access to pytest. If the target repository has other dependencies, install them in the same environment before a local hunt. For Docker runs, put those dependencies in the runner image instead. The commands below use paths relative to this project directory.
+The install needs access to pytest. If the target repository has other dependencies, install them in the same environment before a local hunt. For Docker runs, put those dependencies in the runner image instead.
+
+All commands below use paths relative to the Wobble project directory.
 
 ### Install Wobble as a Python package
 
@@ -37,27 +62,75 @@ python -m wobble hunt /path/to/target-project --runs 20 --minimize --output hunt
 
 The examples below use `.venv/bin/wobble` from this checkout. In an installed environment, run its `wobble` command instead. The `examples/` folders are part of the source checkout, not the installed wheel.
 
-## Quick start with the included tests
+## Run the included demo
 
-First, find a flaky test and save a minimized reproducer:
-
-```sh
-.venv/bin/wobble hunt examples/order_dependent \
-  --runs 20 --seed 0 --minimize --output reports/demo.json
-```
-
-The command should report `test_b_victim` as observed flaky. It should identify `test_a_polluter` as the earlier test needed to make it fail. The output file records every order and outcome. To try another project, replace `examples/order_dependent` with the path to its test repository. Use `--select` to narrow the test set.
-
-To let the installed local Qwen3 model propose a fix, confirm that Ollama is running and lists `qwen3:4b-instruct`:
+This demo uses local Python processes and the Qwen3 model already installed in Ollama. Before steps 2 and 3, check that Ollama is running and lists `qwen3:4b-instruct`:
 
 ```sh
 ollama list
-.venv/bin/wobble repair examples/order_dependent \
-  --evidence reports/demo.json --model qwen3:4b-instruct \
-  --output reports/repair.json --patch-output reports/model-fix.diff
 ```
 
-`repair` tests each candidate in a disposable copy. It writes `reports/model-fix.diff` only when the model patch passes final verification. It does not apply that patch to the target folder. The local runner executes target tests in place, so use it only with code you trust.
+### 1. Hunt and minimize
+
+Find a flaky test and save a minimized reproducer:
+
+```sh
+.venv/bin/wobble hunt examples/order_dependent \
+  --runs 20 --seed 0 --minimize --output reports/live-demo-hunt.json
+```
+
+The command should report `test_b_victim` as observed flaky. In the recorded demo, it failed in 7 of 20 orders. Wobble reduced the failure to `test_a_polluter` followed by `test_b_victim`. The hunt file records every order, outcome, and minimization replay.
+
+### 2. Let the model investigate
+
+Run a separate hunt that lets Qwen3 choose follow-up experiments:
+
+```sh
+.venv/bin/wobble hunt examples/order_dependent \
+  --runs 20 --seed 0 --agent --model qwen3:4b-instruct \
+  --output reports/live-demo-agent.json
+```
+
+This command starts its own 20 shuffled runs. It does not continue step 1. The model can request `run_isolated`, `run_before_victim`, or `minimize_order`. Wobble executes each request and records the observation.
+
+`--agent` and `--minimize` cannot be used in the same hunt. Step 3 uses the reliable minimized report from step 1.
+
+### 3. Propose and verify a repair
+
+Give the minimized hunt file to the local model:
+
+```sh
+.venv/bin/wobble repair examples/order_dependent \
+  --evidence reports/live-demo-hunt.json \
+  --model qwen3:4b-instruct --no-baseline \
+  --screen-runs 5 --verify-runs 100 \
+  --output reports/live-demo-repair.json \
+  --patch-output reports/live-demo-fix.diff
+```
+
+- `--evidence` is an input file.
+- `--output` is the detailed result file.
+- `--patch-output` is the proposed fix.
+- `--no-baseline` skips the rule-based fixer so this run shows the model's result alone.
+
+Wobble writes the patch file only after the model patch passes final verification. It applies the patch to a temporary copy, not the target folder.
+
+### Read the results
+
+| File | What to inspect |
+| --- | --- |
+| `reports/live-demo-hunt.json` | `tests` has pass and fail counts. `runs` has each test order and outcome. `investigation.minimized_prefix` names the earlier test needed to reproduce the failure. |
+| `reports/live-demo-agent.json` | `agent.steps` pairs each model action with the result Wobble observed. `agent.diagnosis` is a supported hypothesis, not a verified fix. |
+| `reports/live-demo-repair.json` | `model_attempts` has the model's rationale, candidate patch, screening result, and final verification result. |
+| `reports/live-demo-fix.diff` | The verified model patch. This file exists only after a successful final check. |
+
+In the recorded demo, Qwen3 chose to run the victim alone, minimize a failing order, and run the polluter before the victim. It proposed cleanup after the polluter changed a shared dictionary. The original reproducer failed, the patched reproducer passed, and the full suite passed 100 shuffled reruns.
+
+> **Note:** Your model output can vary. Review the diff before applying it to a real project.
+
+### Try your own project
+
+Replace `examples/order_dependent` with the local path of your project, and use `--select` to narrow the test set. The local runner executes target tests in place, so **use it only with code you trust**.
 
 ## Run in Docker
 
@@ -74,10 +147,11 @@ wobble dockerfile --output runner.Dockerfile
 docker build -f runner.Dockerfile -t wobble-pytest:py311 .
 ```
 
-Then run the same hunt with container isolation:
+Then run a hunt with container isolation:
 
 ```sh
-.venv/bin/wobble hunt examples/order_dependent --runner docker --runs 20 --seed 0 --minimize
+.venv/bin/wobble hunt examples/order_dependent --runner docker \
+  --runs 20 --seed 0 --minimize --output reports/docker-hunt.json
 ```
 
 To test time or CPU behavior, use a fixed profile for each hunt. The JSON report records the profile for every run.
@@ -88,74 +162,68 @@ To test time or CPU behavior, use a fixed profile for each hunt. The JSON report
   --output reports/shifted.json
 ```
 
-The image must contain pytest and the target project's dependencies. Build a derived image and pass its name with `--image` when a project needs more packages. The runner mounts the target repository read only and does not pass the host environment into the container. It disables network access and gives each run a new container. The result directory is the only writable host mount. Docker isolation reduces risk, but it is not a guarantee that arbitrary hostile code is safe.
+### Isolation details
 
-The clock shift uses `libfaketime`. Some programs bypass its time hooks, so confirm a time-sensitive failure with a targeted test. The offset changes wall clock readings; monotonic time stays real. `--timeout` limits the total container run and removes a timed-out container.
+- The image must contain pytest and the target project's dependencies. For extra packages, build a derived image and pass its name with `--image`.
+- The runner mounts the target repository read-only and does not pass the host environment into the container.
+- Network access is disabled and each run gets a new container.
+- The result directory is the only writable host mount.
+- Docker runs use `--pull=never`: build or provide the named image before the hunt.
+- `--timeout` limits the total container run and removes a timed-out container.
 
-## Let a local model investigate
+> **Warning:** Docker isolation reduces risk, but it is not a guarantee that arbitrary hostile code is safe.
 
-Start Ollama and use an installed open-weight model. The default model is Qwen3 4B Instruct. Check it with `wobble doctor`, or run `wobble setup` to install it with consent:
+### Clock shift
 
-```sh
-.venv/bin/wobble doctor
-.venv/bin/wobble hunt examples/order_dependent --runner docker --runs 20 \
-  --seed 0 --agent --model qwen3:4b-instruct --output reports/agent.json
-```
-
-The model sees a short failure log, the ends of a passing and failing order, and a few test functions. It must choose from `run_isolated`, `run_before_victim`, `minimize_order`, `shift_clock`, and `finish`. The clock action adds one hour to the current profile. Every experiment is run by Wobble and written to the JSON evidence. Invalid actions are rejected and retried up to three times. Wobble checks whether the experiments support the model's proposed cause. An unsupported cause is reported as unknown. A supported diagnosis is still a **hypothesis**, not a verified fix. Small models may use the step budget without a useful diagnosis.
-
-Use either `--agent` or `--minimize` in one hunt. To repair from an agent report, the agent must have run `minimize_order`. The quick-start `--minimize` report always provides the required reproducer when minimization succeeds.
+The clock shift uses `libfaketime`. Some programs bypass its time hooks, so confirm a time-sensitive failure with a targeted test. The offset changes wall-clock readings; monotonic time stays real.
 
 ## Verify a patch
 
-Start with a hunt that saved a minimized reproducer. Then give Wobble a unified diff:
+Start with a hunt that saved a minimized reproducer, then give Wobble a unified diff:
 
 ```sh
 .venv/bin/wobble hunt examples/order_dependent --runner docker --runs 20 \
-  --seed 0 --minimize --output reports/demo.json
+  --seed 0 --minimize --output reports/docker-hunt.json
 .venv/bin/wobble verify examples/order_dependent \
-  --patch examples/patches/clear_cache.diff --evidence reports/demo.json \
+  --patch examples/patches/clear_cache.diff --evidence reports/docker-hunt.json \
   --runs 100 --output reports/verification.json
 ```
 
-The verifier copies the repository. It checks that the patch applies, collected tests remain, the victim test function stays unchanged, and existing assertion expressions remain in the source. It confirms the old reproducer fails before the patch and passes after the patch. It then runs the full patched suite in 100 shuffled orders under the conditions saved by the hunt. It stops and reports failure on the first nonpassing run. The original repository is not patched.
+The verifier works on a copy of the repository. It:
 
-The assertion check is a basic guard. It cannot prove that a patch preserves every test's meaning. Even 100 passing runs do not prove the failure rate is zero.
+1. Checks that the patch applies, collected tests remain, the victim test function is unchanged, and existing assertion expressions remain in the source.
+2. Confirms the old reproducer fails before the patch and passes after it.
+3. Runs the full patched suite in 100 shuffled orders under the conditions saved by the hunt, stopping on the first nonpassing run.
 
-## Ask a model to repair
+The original repository is never patched.
 
-Use a hunt report with a minimized reproducer. Wobble first tries a narrow deterministic repair. It then asks a local model to insert code into one test file from the reproducer. The model sees numbered source and the result of any rejected edit. Wobble checks Python syntax, applies the patch in a copy, runs a short screen, and then runs the full verification budget. The report includes both baseline and model outcomes.
+> **Limits:** The assertion check is a basic guard. It cannot prove that a patch preserves every test's meaning. Even 100 passing runs do not prove the failure rate is zero.
 
-```sh
-.venv/bin/wobble repair examples/order_dependent \
-  --evidence reports/demo.json --model qwen3:4b-instruct \
-  --screen-runs 5 --verify-runs 100 \
-  --output reports/repair.json --patch-output reports/model-fix.diff
-```
+## Repair limits and baseline
 
-`--patch-output` writes a model patch only after final verification. The baseline handles one simple pattern: a test writes to a module-level dictionary that the victim reads. It does not try to repair other causes. The three-case model check found three verified repairs from Qwen3 4B Instruct and none from the previous Qwen2.5 Coder 7B installation. A separate environment-variable case also passed 100 Docker reruns. These small results do not establish general repair quality.
+By default, `repair` tries a narrow deterministic baseline before the local model. The baseline handles one module-level dictionary pattern. The demo above uses `--no-baseline` to show the model result alone.
 
-The [model selection check](https://github.com/LiteralKrishu/Wobble/blob/main/docs/model-selection.md) runs three fixed demo cases under the same Docker verification budget.
+For each candidate, Wobble checks Python syntax, applies the patch in a copy, runs a short screen, and then runs the full verification budget. The model can see feedback from a rejected attempt.
+
+The three-case model check found three verified repairs from Qwen3 4B Instruct and none from the previous Qwen2.5 Coder 7B installation. A separate environment-variable case also passed 100 Docker reruns. **These small results do not establish general repair quality.** The [model selection check](docs/model-selection.md) runs three fixed demo cases under the same Docker verification budget.
 
 To run only the baseline while testing a local model setup:
 
 ```sh
 .venv/bin/wobble repair examples/order_dependent \
-  --evidence reports/demo.json --baseline-only --verify-runs 100 \
+  --evidence reports/live-demo-hunt.json --baseline-only --verify-runs 100 \
   --output reports/baseline.json
 ```
 
-The failure rate is the fraction of observed runs that failed. The confidence interval describes sampling uncertainty. A zero failure count does not prove a test is stable. The minimizer returns a **1-minimal** prefix: removing any one remaining test stops the reproduced failure. It does not promise the shortest possible prefix.
+## Reading the statistics
 
-## Run checks
-
-```sh
-.venv/bin/python -m pytest -q tests
-```
+- The **failure rate** is the fraction of observed runs that failed.
+- The **confidence interval** describes sampling uncertainty. A zero failure count does not prove a test is stable.
+- The minimizer returns a *1-minimal* prefix: removing any one remaining test stops the reproduced failure. It does not promise the shortest possible prefix.
 
 ## Command reference
 
-Run `.venv/bin/wobble --help` for the command list. Add `--help` to any command for its current syntax. You can also start the CLI with `.venv/bin/python -m wobble`.
+Run `.venv/bin/wobble --help` for the command list. Add `--help` to any command for its current syntax. You can also start the CLI with `.venv/bin/python -m wobble`. All commands accept `-h` or `--help`.
 
 ### `wobble doctor`, `wobble setup`, and `wobble dockerfile`
 
@@ -176,7 +244,11 @@ Run `.venv/bin/wobble --help` for the command list. Add `--help` to any command 
 
 ### `wobble hunt`
 
-`hunt REPO [OPTIONS]` collects tests in `REPO`, runs shuffled orders, and prints a pass and failure summary for every collected test. `REPO` is a required local directory. The CLI investigates the first observed flaky test when you add `--minimize` or `--agent`.
+```
+hunt REPO [OPTIONS]
+```
+
+Collects tests in `REPO`, runs shuffled orders, and prints a pass and failure summary for every collected test. `REPO` is a required local directory. The CLI investigates the first observed flaky test when you add `--minimize` or `--agent`.
 
 | Flag | Default | What it does |
 | --- | --- | --- |
@@ -199,11 +271,15 @@ Run `.venv/bin/wobble --help` for the command list. Add `--help` to any command 
 | `--replay-budget N` | `80` | Limit pytest replays during `--minimize`. |
 | `--output FILE` | none | Save the full hunt evidence as JSON. |
 
-Docker-only flags have no effect with `--runner local`, except a nonzero clock shift, which the CLI rejects. Docker runs use `--pull=never`; build or provide the named image before the hunt.
+Docker-only flags have no effect with `--runner local`, except a nonzero clock shift, which the CLI rejects.
 
 ### `wobble verify`
 
-`verify REPO --patch FILE --evidence FILE [OPTIONS]` checks a unified diff in a disposable copy of `REPO`. The evidence file must come from a hunt with a successfully minimized reproducer. Verification uses the runner conditions saved in that file. The original target file is not patched.
+```
+verify REPO --patch FILE --evidence FILE [OPTIONS]
+```
+
+Checks a unified diff in a disposable copy of `REPO`. The evidence file must come from a hunt with a successfully minimized reproducer. Verification uses the runner conditions saved in that file.
 
 | Flag | Default | What it does |
 | --- | --- | --- |
@@ -216,7 +292,11 @@ Docker-only flags have no effect with `--runner local`, except a nonzero clock s
 
 ### `wobble repair`
 
-`repair REPO --evidence FILE [OPTIONS]` tries the narrow deterministic baseline and asks a local Ollama model for a cleanup insertion. It screens each candidate, then verifies passing candidates with the final run budget. It uses the runner conditions saved in the hunt evidence.
+```
+repair REPO --evidence FILE [OPTIONS]
+```
+
+Tries the narrow deterministic baseline and asks a local Ollama model for a cleanup insertion. Each candidate is screened, and passing candidates are verified with the final run budget. It uses the runner conditions saved in the hunt evidence.
 
 | Flag | Default | What it does |
 | --- | --- | --- |
@@ -236,7 +316,7 @@ Docker-only flags have no effect with `--runner local`, except a nonzero clock s
 
 ### Model comparison script
 
-The separate script `scripts/evaluate_models.py` runs three prepared cases in Docker and compares each named model with the deterministic baseline. It uses installed models and an existing runner image.
+`scripts/evaluate_models.py` runs three prepared cases in Docker and compares each named model with the deterministic baseline. It uses installed models and an existing runner image.
 
 ```sh
 .venv/bin/python scripts/evaluate_models.py \
@@ -251,4 +331,20 @@ The separate script `scripts/evaluate_models.py` runs three prepared cases in Do
 | `--verify-runs N` | `100` | Use N final verification runs per candidate. |
 | `--output FILE` | `reports/model-benchmark.json` | Save the detailed comparison report. |
 
-All commands accept `-h` or `--help`. Paths passed to `--output` are created as needed. The `reports/` directory is ignored by Git. A successful hunt exits with status 0 even when it finds no flaky test. Verification exits with status 0 only for a verified patch. Repair exits with status 0 for a verified model patch, or for a verified baseline when `--baseline-only` is set; other unverified outcomes exit with status 1. CLI or runner errors exit with status 2.
+Paths passed to `--output` are created as needed. The `reports/` directory is ignored by Git.
+
+## Exit codes
+
+| Command | Status | Meaning |
+| --- | --- | --- |
+| `hunt` | `0` | Success, even when no flaky test is found. |
+| `verify` | `0` | Verified patch only. |
+| `repair` | `0` | Verified model patch, or verified baseline when `--baseline-only` is set. |
+| `repair` | `1` | Any other unverified outcome. |
+| any | `2` | CLI or runner error. |
+
+## Run checks
+
+```sh
+.venv/bin/python -m pytest -q tests
+```
